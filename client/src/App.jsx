@@ -292,7 +292,7 @@ function App() {
   ]);
 
   function connectSalesforce() {
-    window.location.href = '${API_BASE_URL}/auth/login';
+    window.location.href = `${API_BASE_URL}/auth/login`;
   }
 
   function openCreateForm() {
