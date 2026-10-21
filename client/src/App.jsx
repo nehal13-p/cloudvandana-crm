@@ -2,6 +2,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
 
+// Uses the deployed backend when VITE_API_BASE_URL is configured.
+// Falls back to localhost for local development.
+const API_BASE_URL = (
+  import.meta.env.VITE_API_BASE_URL || "http://localhost:5000"
+).replace(/\/+$/, "");
+
 const OBJECTS = ["Account", "Opportunity", "Lead", "Contact", "Case"];
 
 const OBJECT_DESCRIPTIONS = {
@@ -157,9 +163,13 @@ function App() {
   async function checkConnection() {
     try {
       const response = await fetch(
-        "http://localhost:5000/api/salesforce/status"
+        `${API_BASE_URL}/api/salesforce/status`
       );
       const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "Unable to check Salesforce connection.");
+      }
 
       setConnected(data.connected);
       setError(
@@ -168,7 +178,8 @@ function App() {
           : "Connect your Salesforce account to manage records."
       );
     } catch {
-      setError("Cannot reach the backend. Check that the server is running.");
+      setConnected(false);
+      setError("Cannot reach the backend. Check the backend URL and server status.");
     }
   }
 
@@ -184,7 +195,7 @@ function App() {
 
     try {
       const response = await fetch(
-        `http://localhost:5000/api/salesforce/${objectType}`
+        `${API_BASE_URL}/api/salesforce/${objectType}`
       );
       const data = await response.json();
 
@@ -214,7 +225,7 @@ function App() {
 
     try {
       const response = await fetch(
-        `http://localhost:5000/api/salesforce/${objectType}/next?cursor=${encodeURIComponent(
+        `${API_BASE_URL}/api/salesforce/${objectType}/next?cursor=${encodeURIComponent(
           nextRecordsUrl
         )}`
       );
@@ -281,7 +292,7 @@ function App() {
   ]);
 
   function connectSalesforce() {
-    window.location.href = "http://localhost:5000/auth/login";
+    window.location.href = '${API_BASE_URL}/auth/login';
   }
 
   function openCreateForm() {
@@ -338,8 +349,8 @@ function App() {
 
     try {
       const url = editingId
-        ? `http://localhost:5000/api/salesforce/${objectType}/${editingId}`
-        : `http://localhost:5000/api/salesforce/${objectType}`;
+        ? `${API_BASE_URL}/api/salesforce/${objectType}/${editingId}`
+        : `${API_BASE_URL}/api/salesforce/${objectType}`;
 
       const response = await fetch(url, {
         method: editingId ? "PATCH" : "POST",
@@ -384,7 +395,7 @@ function App() {
 
     try {
       const response = await fetch(
-        `http://localhost:5000/api/salesforce/${objectType}/${record.Id}`,
+        `${API_BASE_URL}/api/salesforce/${objectType}/${record.Id}`,
         { method: "DELETE" }
       );
       const data = await response.json();
@@ -418,7 +429,9 @@ function App() {
 
         <div className="header-right">
           <div
-            className={`connection ${connected ? "connection-online" : "connection-offline"}`}
+            className={`connection ${
+              connected ? "connection-online" : "connection-offline"
+            }`}
             role="status"
           >
             <span
@@ -430,7 +443,10 @@ function App() {
           </div>
 
           {!connected && (
-            <button className="header-connect-button" onClick={connectSalesforce}>
+            <button
+              className="header-connect-button"
+              onClick={connectSalesforce}
+            >
               Connect Salesforce
             </button>
           )}
@@ -610,7 +626,11 @@ function App() {
                 >
                   Cancel
                 </button>
-                <button type="submit" className="primary-button" disabled={loading}>
+                <button
+                  type="submit"
+                  className="primary-button"
+                  disabled={loading}
+                >
                   {loading
                     ? "Saving..."
                     : editingId
@@ -634,7 +654,9 @@ function App() {
 
             <div className="record-count" aria-live="polite">
               <span className="record-count-number">{records.length}</span>
-              <span>{records.length === 1 ? "record loaded" : "records loaded"}</span>
+              <span>
+                {records.length === 1 ? "record loaded" : "records loaded"}
+              </span>
             </div>
           </div>
 
@@ -696,14 +718,18 @@ function App() {
                           <button
                             className="edit-button"
                             onClick={() => openEditForm(record)}
-                            aria-label={`Edit ${record.Name || record.Subject || record.Id}`}
+                            aria-label={`Edit ${
+                              record.Name || record.Subject || record.Id
+                            }`}
                           >
                             Edit
                           </button>
                           <button
                             className="danger-button"
                             onClick={() => deleteRecord(record)}
-                            aria-label={`Delete ${record.Name || record.Subject || record.Id}`}
+                            aria-label={`Delete ${
+                              record.Name || record.Subject || record.Id
+                            }`}
                           >
                             Delete
                           </button>
