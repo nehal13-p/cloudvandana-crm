@@ -245,7 +245,7 @@ app.get("/auth/callback", async (req, res) => {
     };
 
     console.log("Salesforce OAuth succeeded.");
-    res.send("Salesforce connected successfully! Return to your CRM.");
+    res.redirect("https://cloudvandana-crm.vercel.app/");
   } catch (error) {
     console.error("OAuth error:", error.message);
     res.status(500).send(
