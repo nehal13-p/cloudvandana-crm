@@ -9,13 +9,20 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 const API_VERSION = "v60.0";
+const FRONTEND_URL = "https://cloudvandana-crm.vercel.app";
+
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const LOGIN_TTL_MS = 10 * 60 * 1000;
+const HANDOFF_TTL_MS = 60 * 1000;
 
 app.use(
   cors({
     origin: [
       "http://localhost:5173",
-      "https://cloudvandana-crm.vercel.app",
+      FRONTEND_URL,
     ],
+    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "X-CRM-Session"],
   })
 );
 app.use(express.json({ limit: "100kb" }));
@@ -26,8 +33,14 @@ const {
   SALESFORCE_CALLBACK_URL,
 } = process.env;
 
+// Each login attempt is tied to the browser that started it.
 const pendingLogins = new Map();
-let salesforceConnection = null;
+
+// OAuth handoff codes are short-lived and can only be used once.
+const pendingHandoffs = new Map();
+
+// Salesforce connections are isolated by high-entropy browser session IDs.
+const salesforceSessions = new Map();
 
 const OBJECT_FIELDS = {
   Account: ["Id", "Name", "Type", "Industry", "Phone", "Website"],
@@ -52,6 +65,30 @@ const REQUIRED_FIELDS = {
   Contact: ["LastName"],
   Case: ["Status", "Origin"],
 };
+
+function isValidSessionId(value) {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function getSessionId(req) {
+  const sessionId = req.get("X-CRM-Session");
+  return isValidSessionId(sessionId) ? sessionId : null;
+}
+
+function getActiveSession(sessionId) {
+  if (!sessionId) return null;
+
+  const session = salesforceSessions.get(sessionId);
+  if (!session) return null;
+
+  if (Date.now() - session.lastActivity > SESSION_TTL_MS) {
+    salesforceSessions.delete(sessionId);
+    return null;
+  }
+
+  session.lastActivity = Date.now();
+  return session;
+}
 
 function getObjectName(req, res) {
   const objectName = req.params.objectName;
@@ -93,21 +130,26 @@ function getWritableData(objectName, body) {
   return { data };
 }
 
-async function salesforceRequest(path, options = {}) {
-  if (!salesforceConnection) {
+async function salesforceRequest(req, path, options = {}) {
+  const sessionId = getSessionId(req);
+  const session = getActiveSession(sessionId);
+
+  if (!session) {
     const error = new Error(
-      "Salesforce is not connected. Please connect your account first."
+      "This browser is not connected to Salesforce. Please connect your account."
     );
     error.status = 401;
     throw error;
   }
 
+  const connection = session.connection;
+
   const response = await fetch(
-    `${salesforceConnection.instanceUrl}/services/data/${API_VERSION}${path}`,
+    `${connection.instanceUrl}/services/data/${API_VERSION}${path}`,
     {
       ...options,
       headers: {
-        Authorization: `Bearer ${salesforceConnection.accessToken}`,
+        Authorization: `Bearer ${connection.accessToken}`,
         ...(options.body ? { "Content-Type": "application/json" } : {}),
         ...options.headers,
       },
@@ -157,11 +199,23 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Salesforce OAuth with PKCE.
+// Start Salesforce OAuth. The browser session ID is bound to OAuth state.
 app.get("/auth/login", (req, res) => {
-  if (!SALESFORCE_CLIENT_ID || !SALESFORCE_CALLBACK_URL) {
+  if (
+    !SALESFORCE_CLIENT_ID ||
+    !SALESFORCE_CLIENT_SECRET ||
+    !SALESFORCE_CALLBACK_URL
+  ) {
     return res.status(500).send(
-      "Salesforce OAuth configuration is missing. Check server/.env."
+      "Salesforce OAuth configuration is missing. Check the Render environment variables."
+    );
+  }
+
+  const sessionId = req.query.sessionId;
+
+  if (!isValidSessionId(sessionId)) {
+    return res.status(400).send(
+      "Invalid browser session. Return to the CRM and try connecting again."
     );
   }
 
@@ -172,7 +226,11 @@ app.get("/auth/login", (req, res) => {
     .digest("base64url");
   const state = crypto.randomBytes(32).toString("hex");
 
-  pendingLogins.set(state, { verifier, createdAt: Date.now() });
+  pendingLogins.set(state, {
+    verifier,
+    sessionId,
+    createdAt: Date.now(),
+  });
 
   const params = new URLSearchParams({
     response_type: "code",
@@ -204,7 +262,10 @@ app.get("/auth/callback", async (req, res) => {
   const login = pendingLogins.get(state);
   pendingLogins.delete(state);
 
-  if (!login || Date.now() - login.createdAt > 10 * 60 * 1000) {
+  if (
+    !login ||
+    Date.now() - login.createdAt > LOGIN_TTL_MS
+  ) {
     return res.status(400).send(
       "Login session expired or invalid. Please connect again."
     );
@@ -222,7 +283,7 @@ app.get("/auth/callback", async (req, res) => {
           grant_type: "authorization_code",
           code,
           client_id: SALESFORCE_CLIENT_ID,
-          client_secret: SALESFORCE_CLIENT_SECRET || "",
+          client_secret: SALESFORCE_CLIENT_SECRET,
           redirect_uri: SALESFORCE_CALLBACK_URL,
           code_verifier: login.verifier,
         }),
@@ -234,18 +295,32 @@ app.get("/auth/callback", async (req, res) => {
     if (!tokenResponse.ok) {
       console.error("Salesforce token exchange failed:", tokenData);
       return res.status(400).send(
-        "Could not connect Salesforce. Check the backend terminal."
+        "Could not connect Salesforce. Please return to the CRM and try again."
       );
     }
 
-    salesforceConnection = {
-      accessToken: tokenData.access_token,
-      instanceUrl: tokenData.instance_url,
-      refreshToken: tokenData.refresh_token || null,
-    };
+    if (!tokenData.access_token || !tokenData.instance_url) {
+      return res.status(400).send(
+        "Salesforce did not return the required connection details."
+      );
+    }
 
-    console.log("Salesforce OAuth succeeded.");
-    res.redirect("https://cloudvandana-crm.vercel.app/");
+    // A one-time code hands the connection back to the initiating browser.
+    const handoffCode = crypto.randomBytes(32).toString("hex");
+
+    pendingHandoffs.set(handoffCode, {
+      sessionId: login.sessionId,
+      connection: {
+        accessToken: tokenData.access_token,
+        instanceUrl: tokenData.instance_url,
+        refreshToken: tokenData.refresh_token || null,
+      },
+      createdAt: Date.now(),
+    });
+
+    res.redirect(
+      `${FRONTEND_URL}/?oauth_code=${encodeURIComponent(handoffCode)}`
+    );
   } catch (error) {
     console.error("OAuth error:", error.message);
     res.status(500).send(
@@ -254,10 +329,49 @@ app.get("/auth/callback", async (req, res) => {
   }
 });
 
+// Exchange the one-time OAuth handoff code for this browser's session.
+app.post("/auth/session", (req, res) => {
+  const sessionId = getSessionId(req);
+  const { code } = req.body || {};
+
+  if (!sessionId) {
+    return res.status(400).json({ error: "Invalid browser session." });
+  }
+
+  if (typeof code !== "string" || !/^[a-f0-9]{64}$/.test(code)) {
+    return res.status(400).json({ error: "Invalid or missing handoff code." });
+  }
+
+  const handoff = pendingHandoffs.get(code);
+
+  // Delete immediately so the code cannot be reused.
+  pendingHandoffs.delete(code);
+
+  if (
+    !handoff ||
+    Date.now() - handoff.createdAt > HANDOFF_TTL_MS ||
+    handoff.sessionId !== sessionId
+  ) {
+    return res.status(401).json({
+      error: "The login handoff expired or belongs to another browser. Please connect again.",
+    });
+  }
+
+  salesforceSessions.set(sessionId, {
+    connection: handoff.connection,
+    lastActivity: Date.now(),
+  });
+
+  res.json({ connected: true });
+});
+
 app.get("/api/salesforce/status", (req, res) => {
+  const sessionId = getSessionId(req);
+  const session = getActiveSession(sessionId);
+
   res.json({
-    connected: Boolean(salesforceConnection),
-    instanceUrl: salesforceConnection?.instanceUrl || null,
+    connected: Boolean(session),
+    instanceUrl: session?.connection.instanceUrl || null,
   });
 });
 
@@ -268,12 +382,12 @@ app.get("/api/salesforce/:objectName", async (req, res) => {
 
   try {
     const fields = OBJECT_FIELDS[objectName].join(", ");
-
     const soql =
       `SELECT ${fields} FROM ${objectName} ` +
       "ORDER BY CreatedDate DESC LIMIT 21";
 
     const data = await salesforceRequest(
+      req,
       `/query?q=${encodeURIComponent(soql)}`
     );
 
@@ -322,12 +436,12 @@ app.get("/api/salesforce/:objectName/next", async (req, res) => {
 
   try {
     const fields = OBJECT_FIELDS[objectName].join(", ");
-
     const soql =
       `SELECT ${fields} FROM ${objectName} ` +
       `ORDER BY CreatedDate DESC LIMIT 21 OFFSET ${offset}`;
 
     const data = await salesforceRequest(
+      req,
       `/query?q=${encodeURIComponent(soql)}`
     );
 
@@ -369,10 +483,14 @@ app.post("/api/salesforce/:objectName", async (req, res) => {
   }
 
   try {
-    const data = await salesforceRequest(`/sobjects/${objectName}`, {
-      method: "POST",
-      body: JSON.stringify(result.data),
-    });
+    const data = await salesforceRequest(
+      req,
+      `/sobjects/${objectName}`,
+      {
+        method: "POST",
+        body: JSON.stringify(result.data),
+      }
+    );
 
     res.status(201).json({
       message: `${objectName} created successfully.`,
@@ -391,9 +509,7 @@ app.patch("/api/salesforce/:objectName/:id", async (req, res) => {
   const { id } = req.params;
 
   if (!/^[a-zA-Z0-9]{15,18}$/.test(id)) {
-    return res.status(400).json({
-      error: "Invalid Salesforce record ID.",
-    });
+    return res.status(400).json({ error: "Invalid Salesforce record ID." });
   }
 
   const result = getWritableData(objectName, req.body);
@@ -407,6 +523,7 @@ app.patch("/api/salesforce/:objectName/:id", async (req, res) => {
 
   try {
     await salesforceRequest(
+      req,
       `/sobjects/${objectName}/${encodeURIComponent(id)}`,
       {
         method: "PATCH",
@@ -432,13 +549,12 @@ app.delete("/api/salesforce/:objectName/:id", async (req, res) => {
   const { id } = req.params;
 
   if (!/^[a-zA-Z0-9]{15,18}$/.test(id)) {
-    return res.status(400).json({
-      error: "Invalid Salesforce record ID.",
-    });
+    return res.status(400).json({ error: "Invalid Salesforce record ID." });
   }
 
   try {
     await salesforceRequest(
+      req,
       `/sobjects/${objectName}/${encodeURIComponent(id)}`,
       { method: "DELETE" }
     );
@@ -453,6 +569,29 @@ app.delete("/api/salesforce/:objectName/:id", async (req, res) => {
   }
 });
 
+// Remove expired login attempts and handoff codes periodically.
+setInterval(() => {
+  const now = Date.now();
+
+  for (const [key, value] of pendingLogins) {
+    if (now - value.createdAt > LOGIN_TTL_MS) {
+      pendingLogins.delete(key);
+    }
+  }
+
+  for (const [key, value] of pendingHandoffs) {
+    if (now - value.createdAt > HANDOFF_TTL_MS) {
+      pendingHandoffs.delete(key);
+    }
+  }
+
+  for (const [key, value] of salesforceSessions) {
+    if (now - value.lastActivity > SESSION_TTL_MS) {
+      salesforceSessions.delete(key);
+    }
+  }
+}, 60_000).unref();
+
 app.listen(PORT, () => {
-  console.log(`Backend running on http://localhost:${PORT}`);
+  console.log(`Backend running on port ${PORT}`);
 });

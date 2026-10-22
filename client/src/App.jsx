@@ -2,8 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
 
-// Uses the deployed backend when VITE_API_BASE_URL is configured.
-// Falls back to localhost for local development.
+// Uses the deployed backend when configured; otherwise uses localhost.
 const API_BASE_URL = (
   import.meta.env.VITE_API_BASE_URL || "http://localhost:5000"
 ).replace(/\/+$/, "");
@@ -123,10 +122,37 @@ const FORM_FIELDS = {
   ],
 };
 
+// Create an empty form for the selected Salesforce object.
 function emptyForm(objectType) {
   return Object.fromEntries(
     FORM_FIELDS[objectType].map((field) => [field.name, ""])
   );
+}
+
+// Each browser tab gets its own session ID.
+// sessionStorage keeps it available during OAuth redirects and page refreshes.
+function getSessionId() {
+  let sessionId = sessionStorage.getItem("crm_session_id");
+
+  if (!/^[a-f0-9]{64}$/.test(sessionId || "")) {
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+
+    sessionId = Array.from(bytes)
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+
+    sessionStorage.setItem("crm_session_id", sessionId);
+  }
+
+  return sessionId;
+}
+
+// Attach the browser session ID to requests handled by our backend.
+function sessionHeaders(extra = {}) {
+  return {
+    ...extra,
+    "X-CRM-Session": getSessionId(),
+  };
 }
 
 function App() {
@@ -146,10 +172,93 @@ function App() {
   const sentinelRef = useRef(null);
   const loadingMoreRef = useRef(false);
 
+  // Check whether this browser has a Salesforce session.
+  async function checkConnection() {
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/salesforce/status`,
+        { headers: sessionHeaders() }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data.error || "Unable to check Salesforce connection."
+        );
+      }
+
+      setConnected(Boolean(data.connected));
+
+      if (data.connected) {
+        setError("");
+      } else {
+        setError("Connect your Salesforce account to manage records.");
+      }
+    } catch {
+      setConnected(false);
+      setError(
+        "Cannot reach the backend. Check the backend URL and server status."
+      );
+    }
+  }
+
+  // Finish OAuth using the one-time code returned by the backend.
   useEffect(() => {
-    checkConnection();
+    let cancelled = false;
+
+    async function initializeApp() {
+      const params = new URLSearchParams(window.location.search);
+      const oauthCode = params.get("oauth_code");
+
+      if (oauthCode) {
+        // Remove the one-time code from the address bar immediately.
+        window.history.replaceState(
+          {},
+          document.title,
+          window.location.pathname
+        );
+
+        try {
+          const response = await fetch(`${API_BASE_URL}/auth/session`, {
+            method: "POST",
+            headers: sessionHeaders({
+              "Content-Type": "application/json",
+            }),
+            body: JSON.stringify({ code: oauthCode }),
+          });
+
+          const data = await response.json();
+
+          if (!response.ok) {
+            throw new Error(
+              data.error || "Unable to finish Salesforce login."
+            );
+          }
+
+          if (!cancelled) {
+            setNotice("Salesforce connected successfully.");
+          }
+        } catch (err) {
+          if (!cancelled) {
+            setError(err.message);
+          }
+        }
+      }
+
+      if (!cancelled) {
+        await checkConnection();
+      }
+    }
+
+    initializeApp();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
+  // Load records when the selected object or connection changes.
   useEffect(() => {
     if (connected) {
       fetchRecords();
@@ -160,29 +269,7 @@ function App() {
     }
   }, [objectType, connected]);
 
-  async function checkConnection() {
-    try {
-      const response = await fetch(
-        `${API_BASE_URL}/api/salesforce/status`
-      );
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || "Unable to check Salesforce connection.");
-      }
-
-      setConnected(data.connected);
-      setError(
-        data.connected
-          ? ""
-          : "Connect your Salesforce account to manage records."
-      );
-    } catch {
-      setConnected(false);
-      setError("Cannot reach the backend. Check the backend URL and server status.");
-    }
-  }
-
+  // Load the first 20 records.
   const fetchRecords = useCallback(async () => {
     setLoading(true);
     setError("");
@@ -195,8 +282,10 @@ function App() {
 
     try {
       const response = await fetch(
-        `${API_BASE_URL}/api/salesforce/${objectType}`
+        `${API_BASE_URL}/api/salesforce/${objectType}`,
+        { headers: sessionHeaders() }
       );
+
       const data = await response.json();
 
       if (!response.ok) {
@@ -214,6 +303,7 @@ function App() {
     }
   }, [objectType]);
 
+  // Append the next 20 records without replacing the existing records.
   const loadMoreRecords = useCallback(async () => {
     if (!connected || !nextRecordsUrl || loadingMoreRef.current) {
       return;
@@ -227,8 +317,10 @@ function App() {
       const response = await fetch(
         `${API_BASE_URL}/api/salesforce/${objectType}/next?cursor=${encodeURIComponent(
           nextRecordsUrl
-        )}`
+        )}`,
+        { headers: sessionHeaders() }
       );
+
       const data = await response.json();
 
       if (!response.ok) {
@@ -254,6 +346,7 @@ function App() {
     }
   }, [connected, nextRecordsUrl, objectType]);
 
+  // Automatically request more records as the user scrolls down.
   useEffect(() => {
     const sentinel = sentinelRef.current;
 
@@ -281,6 +374,7 @@ function App() {
     );
 
     observer.observe(sentinel);
+
     return () => observer.disconnect();
   }, [
     connected,
@@ -291,8 +385,12 @@ function App() {
     records.length,
   ]);
 
+  // Begin OAuth for this browser's session.
   function connectSalesforce() {
-    window.location.href = `${API_BASE_URL}/auth/login`;
+    const sessionId = getSessionId();
+
+    window.location.href =
+      `${API_BASE_URL}/auth/login?sessionId=${encodeURIComponent(sessionId)}`;
   }
 
   function openCreateForm() {
@@ -330,6 +428,7 @@ function App() {
     }));
   }
 
+  // Create or update a Salesforce record.
   async function submitForm(event) {
     event.preventDefault();
     setError("");
@@ -354,7 +453,9 @@ function App() {
 
       const response = await fetch(url, {
         method: editingId ? "PATCH" : "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: sessionHeaders({
+          "Content-Type": "application/json",
+        }),
         body: JSON.stringify(payload),
       });
 
@@ -365,7 +466,9 @@ function App() {
           ? ` Missing fields: ${data.missingFields.join(", ")}.`
           : "";
 
-        throw new Error((data.error || "Unable to save record.") + missing);
+        throw new Error(
+          (data.error || "Unable to save record.") + missing
+        );
       }
 
       closeForm();
@@ -378,6 +481,7 @@ function App() {
     }
   }
 
+  // Delete a Salesforce record.
   async function deleteRecord(record) {
     const displayName =
       record.Name ||
@@ -396,8 +500,12 @@ function App() {
     try {
       const response = await fetch(
         `${API_BASE_URL}/api/salesforce/${objectType}/${record.Id}`,
-        { method: "DELETE" }
+        {
+          method: "DELETE",
+          headers: sessionHeaders(),
+        }
       );
+
       const data = await response.json();
 
       if (!response.ok) {
@@ -418,6 +526,7 @@ function App() {
           <div className="brand-mark" aria-hidden="true">
             CV
           </div>
+
           <div>
             <p className="brand-eyebrow">WORKSPACE</p>
             <h1>CloudVandana CRM</h1>
@@ -462,6 +571,7 @@ function App() {
               View, organize, and manage your Salesforce records in one place.
             </p>
           </div>
+
           <div className="workspace-badge">
             <span className="workspace-badge-dot" />
             {connected ? "Workspace active" : "Awaiting connection"}
@@ -517,7 +627,9 @@ function App() {
 
         {notice && (
           <div className="success-message" role="status">
-            <span className="message-icon" aria-hidden="true">✓</span>
+            <span className="message-icon" aria-hidden="true">
+              ✓
+            </span>
             {notice}
             <button
               className="message-dismiss"
@@ -531,7 +643,9 @@ function App() {
 
         {error && (
           <div className="error-message" role="alert">
-            <span className="message-icon" aria-hidden="true">!</span>
+            <span className="message-icon" aria-hidden="true">
+              !
+            </span>
             {error}
             <button
               className="message-dismiss"
@@ -550,6 +664,7 @@ function App() {
                 <span className="form-icon" aria-hidden="true">
                   {editingId ? "✎" : "＋"}
                 </span>
+
                 <div>
                   <p className="section-eyebrow">
                     {editingId ? "UPDATE RECORD" : "NEW RECORD"}
@@ -591,6 +706,7 @@ function App() {
                         <option value="">
                           Select {FIELD_LABELS[field.name] || field.name}
                         </option>
+
                         {field.options.map((option) => (
                           <option key={option} value={option}>
                             {option}
@@ -626,6 +742,7 @@ function App() {
                 >
                   Cancel
                 </button>
+
                 <button
                   type="submit"
                   className="primary-button"
@@ -669,16 +786,15 @@ function App() {
 
           {!loading && connected && records.length === 0 && !error && (
             <div className="empty-state">
-              <div className="empty-state-icon" aria-hidden="true">▤</div>
+              <div className="empty-state-icon" aria-hidden="true">
+                ▤
+              </div>
               <h3>No {objectType} records yet</h3>
               <p>
                 When records are available, they will appear here. You can also
                 create a new record to get started.
               </p>
-              <button
-                className="primary-button"
-                onClick={openCreateForm}
-              >
+              <button className="primary-button" onClick={openCreateForm}>
                 <span aria-hidden="true">＋</span> Add {objectType}
               </button>
             </div>
@@ -724,6 +840,7 @@ function App() {
                           >
                             Edit
                           </button>
+
                           <button
                             className="danger-button"
                             onClick={() => deleteRecord(record)}
@@ -749,6 +866,7 @@ function App() {
                 className="scroll-sentinel"
                 aria-hidden="true"
               />
+
               <button
                 className="secondary-button load-more-button"
                 onClick={loadMoreRecords}
@@ -760,9 +878,12 @@ function App() {
                     Loading more records...
                   </>
                 ) : (
-                  <>Load More Records <span aria-hidden="true">↓</span></>
+                  <>
+                    Load More Records <span aria-hidden="true">↓</span>
+                  </>
                 )}
               </button>
+
               <p className="pagination-hint">
                 More records will be added below the existing records.
               </p>
@@ -777,7 +898,8 @@ function App() {
 
           {!hasMore && records.length > 0 && !loading && (
             <p className="message end-message">
-              <span aria-hidden="true">✓</span> You've reached the end of the records.
+              <span aria-hidden="true">✓</span> You've reached the end of the
+              records.
             </p>
           )}
         </section>
